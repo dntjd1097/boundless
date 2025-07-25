@@ -16,13 +16,26 @@ mcycle_price_stake_token = "0.0001"
 priority_requestor_addresses = [
 	"0x48268bE6235A23eb7b67356469362869D5d0293f",
 	"0x0466ACfc0F27bBA9fBB7A8508f576527e81E83Bd",
+	 "0x2546c553d857d20658ece248f7c7d0861a240681",
+    "0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0",
+    "0x734dF7809c4ef94Da037449C287166D114503198",
+    "0x3Ee7d9175eC8BB9e16e8FD3AbDEF5a354b247528",
+    "0x2693946791da99da78ac441aba6d5ce2bccd96d3",
 ]
+allow_client_addresses = [
+"0x2546c553d857d20658ece248f7c7d0861a240681",
+    "0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0",
+    "0x734dF7809c4ef94Da037449C287166D114503198",
+    "0x3Ee7d9175eC8BB9e16e8FD3AbDEF5a354b247528",
+    "0x2693946791da99da78ac441aba6d5ce2bccd96d3",
+]
+
 # Estimated peak performance of the proving cluster, in kHz.
 #
 # Used to estimate proving capacity and accept only as much work as the prover can handle. Estimates
 # can be derived from benchmarking using Bento CLI or from data based on fulfilling market orders.
 # For more information, see https://docs.beboundless.xyz/provers/broker#benchmarking-bento
-peak_prove_khz = 100
+peak_prove_khz = 130
 # Optional max cycles (in mcycles)
 #
 # Orders over this max_cycles will be skipped after preflight
@@ -32,7 +45,7 @@ max_mcycle_limit = 8000
 # Orders that produce a journal larger than this size in preflight will be skipped. Since journals
 # must be posted onchain to complete an order, an excessively large journal may prevent completion
 # of a request.
-max_journal_bytes = 10000
+max_journal_bytes = 12000
 # Min seconds left before the deadline to consider bidding on a request.
 # 
 # If there is not enough time left before the deadline, the prover may not be able to complete
@@ -43,7 +56,7 @@ lookback_blocks = 300 # 300 blocks ~ 1 hour @ 12s block times
 # Max stake amount, denominated in the Boundless staking token.
 #
 # Requests that require a higher stake than this will not be considered.
-max_stake = "25" # USDC
+max_stake = "5" # USDC
 # Max input / image file size allowed for downloading from request URLs.
 max_file_size = 50_000_000
 # Max retries for fetching input / image contents from URLs
@@ -63,6 +76,7 @@ max_concurrent_proofs = 2
 # - "observation_time": Process orders in the order they were observed (FIFO)
 # - "shortest_expiry": Process orders by shortest expiry first (earliest deadline)
 #order_pricing_priority = "random"
+order_pricing_priority = "observation_time"
 # Order commitment priority mode
 #
 # Determines how orders are prioritized when committing to prove them. Options:
@@ -73,7 +87,7 @@ max_concurrent_proofs = 2
 #
 # The broker service has a number of subtasks. Some are considered critical. If a task fails, it
 # will be retried, but after this number of retries, the process will exit.
-max_critical_task_retries = 10
+max_critical_task_retries = 12
 # Optional allow list for customer address.
 #
 # If enabled, all requests from clients not in the allow list are skipped.
@@ -145,7 +159,7 @@ req_retry_sleep_ms = 300
 # This is separate from the request retry count, as the proving process
 # is a multi-step process involving multiple API calls to create a proof
 # job and then polling for the proof job to complete.
-proof_retry_count = 2
+proof_retry_count = 4
 # Number of milliseconds to sleep between proof retries.
 proof_retry_sleep_ms = 300
 # Set builder guest program (ELF) path
