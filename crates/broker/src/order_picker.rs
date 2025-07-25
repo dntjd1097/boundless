@@ -13,29 +13,27 @@
 // limitations under the License.
 
 use risc0_zkvm::sha::Digest;
-use sha2::{Digest as Sha2Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
     chain_monitor::ChainMonitorService,
-    config::ConfigLock,
+    config::{ConfigLock, OrderPricingPriority},
     db::DbObj,
     errors::CodedError,
-    provers::{ProverError, ProverObj},
-    storage::{upload_image_uri, upload_input_uri},
+    provers::ProverObj,
     task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, OrderRequest, OrderStateChange,
+    utils, FulfillmentType, OrderRequest,
 };
 use crate::{
     now_timestamp,
-    provers::{ExecutorResp, ProofResult},
+    provers::ProofResult,
 };
 use alloy::{
     network::Ethereum,
     primitives::{
-        utils::{format_ether, format_units, parse_ether, parse_units},
+        utils::{format_ether, parse_ether},
         Address, U256,
     },
     providers::{Provider, WalletProvider},
@@ -43,12 +41,12 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use boundless_market::{
-    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType},
+    contracts::{boundless_market::BoundlessMarketService, RequestError},
     selector::SupportedSelectors,
 };
 use moka::future::Cache;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -133,7 +131,6 @@ pub struct OrderPicker<P> {
     stake_token_decimals: u8,
     order_cache: OrderCache,
     preflight_cache: PreflightCache,
-    order_state_tx: broadcast::Sender<OrderStateChange>,
 }
 
 #[derive(Debug)]
@@ -201,7 +198,6 @@ where
                     .time_to_live(Duration::from_secs(PREFLIGHT_CACHE_TTL_SECS))
                     .build(),
             ),
-            order_state_tx: broadcast::channel(100).0,
         }
     }
 
@@ -579,7 +575,8 @@ fn handle_lock_event(
     
     // Cancel any active tasks for this request_id
     if let Some(tasks) = active_tasks.get_mut(&request_id) {
-        for (_, cancel_token) in tasks.drain() {
+        let task_tokens: Vec<_> = tasks.values().cloned().collect();
+        for cancel_token in task_tokens {
             cancel_token.cancel();
         }
         active_tasks.remove(&request_id);
@@ -596,7 +593,8 @@ fn handle_fulfill_event(
     
     // Cancel any active tasks for this request_id
     if let Some(tasks) = active_tasks.get_mut(&request_id) {
-        for (_, cancel_token) in tasks.drain() {
+        let task_tokens: Vec<_> = tasks.values().cloned().collect();
+        for cancel_token in task_tokens {
             cancel_token.cancel();
         }
         active_tasks.remove(&request_id);
