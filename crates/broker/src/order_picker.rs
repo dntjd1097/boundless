@@ -1,37 +1,54 @@
-// Copyright (c) 2025 RISC Zero, Inc.
+// Copyright 2025 RISC Zero, Inc.
 //
-// All rights reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::collections::VecDeque;
+use risc0_zkvm::sha::Digest;
+use sha2::{Digest as Sha2Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
     chain_monitor::ChainMonitorService,
-    config::{ConfigLock, OrderPricingPriority},
+    config::ConfigLock,
     db::DbObj,
     errors::CodedError,
-    provers::ProverObj,
+    provers::{ProverError, ProverObj},
+    storage::{upload_image_uri, upload_input_uri},
     task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, OrderRequest,
+    utils, FulfillmentType, OrderRequest, OrderStateChange,
 };
-use crate::{now_timestamp, provers::ProofResult};
+use crate::{
+    now_timestamp,
+    provers::{ExecutorResp, ProofResult},
+};
 use alloy::{
     network::Ethereum,
     primitives::{
-        utils::{format_ether, parse_ether},
+        utils::{format_ether, format_units, parse_ether, parse_units},
         Address, U256,
     },
     providers::{Provider, WalletProvider},
+    uint,
 };
 use anyhow::{Context, Result};
 use boundless_market::{
-    contracts::{boundless_market::BoundlessMarketService, RequestError},
+    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType},
     selector::SupportedSelectors,
 };
 use moka::future::Cache;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -39,32 +56,65 @@ use OrderPricingOutcome::{Lock, ProveAfterLockExpire, Skip};
 
 const MIN_CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+const ONE_MILLION: U256 = uint!(1_000_000_U256);
+
 /// Maximum number of orders to cache for deduplication
 const ORDER_DEDUP_CACHE_SIZE: u64 = 5000;
 
 /// In-memory LRU cache for order deduplication by ID (prevents duplicate order processing)
 type OrderCache = Arc<Cache<String, ()>>;
 
-#[derive(Error, Debug)]
+/// Configuration for preflight result caching
+const PREFLIGHT_CACHE_SIZE: u64 = 5000;
+const PREFLIGHT_CACHE_TTL_SECS: u64 = 3 * 60 * 60; // 3 hours
+
+/// Cache for preflight results to avoid duplicate computations
+type PreflightCache = Arc<Cache<PreflightCacheKey, PreflightCacheValue>>;
+
+#[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum OrderPickerErr {
+    #[error("{code} failed to fetch / push input: {0}", code = self.code())]
+    FetchInputErr(#[source] Arc<anyhow::Error>),
+
+    #[error("{code} failed to fetch / push image: {0}", code = self.code())]
+    FetchImageErr(#[source] Arc<anyhow::Error>),
+
+    #[error("{code} guest panicked: {0}", code = self.code())]
+    GuestPanic(String),
+
     #[error("{code} invalid request: {0}", code = self.code())]
-    RequestError(#[from] RequestError),
+    RequestError(Arc<RequestError>),
 
     #[error("{code} RPC error: {0:?}", code = self.code())]
-    RpcErr(anyhow::Error),
+    RpcErr(Arc<anyhow::Error>),
 
     #[error("{code} Unexpected error: {0:?}", code = self.code())]
-    UnexpectedErr(#[from] anyhow::Error),
+    UnexpectedErr(Arc<anyhow::Error>),
 }
 
 impl CodedError for OrderPickerErr {
     fn code(&self) -> &str {
         match self {
+            OrderPickerErr::FetchInputErr(_) => "[B-OP-001]",
+            OrderPickerErr::FetchImageErr(_) => "[B-OP-002]",
+            OrderPickerErr::GuestPanic(_) => "[B-OP-003]",
             OrderPickerErr::RequestError(_) => "[B-OP-004]",
             OrderPickerErr::RpcErr(_) => "[B-OP-005]",
             OrderPickerErr::UnexpectedErr(_) => "[B-OP-500]",
         }
+    }
+}
+
+impl From<anyhow::Error> for OrderPickerErr {
+    fn from(err: anyhow::Error) -> Self {
+        OrderPickerErr::UnexpectedErr(Arc::new(err))
+    }
+}
+
+impl From<RequestError> for OrderPickerErr {
+    fn from(err: RequestError) -> Self {
+        OrderPickerErr::RequestError(Arc::new(err))
     }
 }
 
@@ -82,6 +132,8 @@ pub struct OrderPicker<P> {
     priced_orders_tx: mpsc::Sender<Box<OrderRequest>>,
     stake_token_decimals: u8,
     order_cache: OrderCache,
+    preflight_cache: PreflightCache,
+    order_state_tx: broadcast::Sender<OrderStateChange>,
 }
 
 #[derive(Debug)]
@@ -143,6 +195,13 @@ where
                     .time_to_live(Duration::from_secs(60 * 60)) // 1 hour
                     .build(),
             ),
+            preflight_cache: Arc::new(
+                Cache::builder()
+                    .max_capacity(PREFLIGHT_CACHE_SIZE)
+                    .time_to_live(Duration::from_secs(PREFLIGHT_CACHE_TTL_SECS))
+                    .build(),
+            ),
+            order_state_tx: broadcast::channel(100).0,
         }
     }
 
@@ -468,7 +527,7 @@ where
             .provider
             .get_balance(self.provider.default_signer_address())
             .await
-            .map_err(|err| OrderPickerErr::RpcErr(err.into()))?;
+            .map_err(|err| OrderPickerErr::RpcErr(Arc::new(err.into())))?;
 
         let gas_balance_reserved = self.gas_balance_reserved().await?;
 
@@ -492,6 +551,58 @@ where
     }
 }
 
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum InputCacheKey {
+    Url(String),
+    Hash([u8; 32]),
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct PreflightCacheKey {
+    image_id: Digest,
+    input: InputCacheKey,
+}
+
+#[derive(Clone, Debug)]
+enum PreflightCacheValue {
+    Success { exec_session_id: String, cycle_count: u64, image_id: String, input_id: String },
+    Skip { cached_limit: u64 },
+}
+
+fn handle_lock_event(
+    request_id: U256,
+    active_tasks: &mut BTreeMap<U256, BTreeMap<String, CancellationToken>>,
+    pending_orders: &mut Vec<Box<OrderRequest>>,
+) {
+    // Remove any pending orders for this request_id
+    pending_orders.retain(|order| U256::from(order.request.id) != request_id);
+    
+    // Cancel any active tasks for this request_id
+    if let Some(tasks) = active_tasks.get_mut(&request_id) {
+        for (_, cancel_token) in tasks.drain() {
+            cancel_token.cancel();
+        }
+        active_tasks.remove(&request_id);
+    }
+}
+
+fn handle_fulfill_event(
+    request_id: U256,
+    active_tasks: &mut BTreeMap<U256, BTreeMap<String, CancellationToken>>,
+    pending_orders: &mut Vec<Box<OrderRequest>>,
+) {
+    // Remove any pending orders for this request_id
+    pending_orders.retain(|order| U256::from(order.request.id) != request_id);
+    
+    // Cancel any active tasks for this request_id
+    if let Some(tasks) = active_tasks.get_mut(&request_id) {
+        for (_, cancel_token) in tasks.drain() {
+            cancel_token.cancel();
+        }
+        active_tasks.remove(&request_id);
+    }
+}
+
 impl<P> RetryTask for OrderPicker<P>
 where
     P: Provider<Ethereum> + 'static + Clone + WalletProvider,
@@ -505,7 +616,7 @@ where
 
             let read_config = || -> Result<(usize, OrderPricingPriority), Self::Error> {
                 let cfg = picker.config.lock_all().map_err(|err| {
-                    OrderPickerErr::UnexpectedErr(anyhow::anyhow!("Failed to read config: {err}"))
+                    OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!("Failed to read config: {err}")))
                 })?;
                 Ok((
                     cfg.market.max_concurrent_preflights as usize,

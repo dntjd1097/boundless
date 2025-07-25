@@ -90,7 +90,7 @@ fn rewrite_solidity_interface_files() {
                     sol_contents.replace_range(start..start + end + 1, "");
                 } else {
                     // print the file name and panic if we can't find the matching brace
-                    panic!("Unmatched brace in library {:?}", entry);
+                    panic!("Unmatched brace in library {entry:?}");
                 }
             }
 
